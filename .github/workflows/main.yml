@@ -19,21 +19,21 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Cache pip
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
     - name: Cache PlatformIO
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.platformio
         key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.12'
     - name: Install PlatformIO
@@ -45,6 +45,7 @@ jobs:
          find . -not -path '*/.*' -type f -name 'platformio.ini' -print0 | xargs -0 grep -L "; nowebflash" | xargs -i bash -c "(echo {}; pio run -e cyd -e cyd2usb -d {})"
     - name: Merge flash files
       run: |
+        chmod 755 ~/.platformio/packages/tool-esptoolpy/esptool.py
         find . -path '*/.pio*' -type f -name 'firmware.bin' -printf '%h\n' | xargs -i bash -c "(echo {}; cd {}; ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32 merge_bin -o merged-flash.bin --flash_mode dio --flash_size 4MB 0x1000 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin)"
     - name: Create JSON
       run: |
@@ -75,9 +76,9 @@ jobs:
 
         echo ']}' >> tmp/examples.json
     - name: Setup Github Page
-      uses: actions/configure-pages@v5
+      uses: actions/configure-pages@v6
     - name: Upload webflash files
-      uses: actions/upload-pages-artifact@v3
+      uses: actions/upload-pages-artifact@v5
       with:
         path: ./tmp
 
@@ -94,4 +95,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
