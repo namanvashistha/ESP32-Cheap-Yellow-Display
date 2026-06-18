@@ -66,8 +66,9 @@ const uint16_t COL_NEUTRAL     = TFT_SKYBLUE;
 
 // ===== State =====
 struct StreakState {
-  int currentStreak = 0;
-  int bestStreak = 0;
+  int totalActiveDays = 0;
+  bool weekSolved[7] = {false}; // index 0 = oldest, 6 = today (rolling 7-day window)
+  char weekLetters[7] = {0};    // weekday letter for each cell, computed at fetch
   bool solvedToday = false;
   time_t lastSolveTs = 0;
   bool hasData = false;
@@ -76,13 +77,8 @@ struct StreakState {
 StreakState state;
 
 unsigned long lastFetchMs = 0;
-unsigned long lastTickMs = 0;
 bool blinkPhase = false;
 unsigned long lastBlinkMs = 0;
-
-// Countdown cache (invalidate on full re-render)
-String  cdLastBuf = "";
-uint16_t cdLastColor = 0;
 
 // Forward decls
 time_t parseHttpDate(const String& s);
@@ -90,7 +86,7 @@ void drawGiantTick(int cx, int cy, int span, uint16_t color);
 void thickLine(int x1, int y1, int x2, int y2, int thick, uint16_t color);
 void drawBorder(uint16_t color, bool useGlow);
 void drawBigNumber(const String& n, uint16_t color);
-void drawCountdown(uint16_t color);
+void drawWeekRow(int yCenter);
 void centerText(const char* s, int y);
 
 // ===== Setup =====
@@ -143,13 +139,6 @@ void loop() {
   if (millis() - lastFetchMs > FETCH_INTERVAL_MS) {
     fetchStreak();
     renderAll();
-  }
-
-  // Countdown ticker — minute resolution; check every 10s, redraw only on change
-  if (state.hasData && !state.solvedToday && millis() - lastTickMs > 10000) {
-    lastTickMs = millis();
-    int level = urgencyLevel();
-    drawCountdown(levelColor(level));
   }
 
   // Border blink — asymmetric on/off durations per urgency level
@@ -258,7 +247,7 @@ void fetchStreak() {
   const char* hdrs[] = { "Date" };
   http.collectHeaders(hdrs, 1);
 
-  String body = String("{\"query\":\"query userProfileCalendar($username: String!) { matchedUser(username: $username) { userCalendar { submissionCalendar } } }\",\"variables\":{\"username\":\"") + LEETCODE_USERNAME + "\"}}";
+  String body = String("{\"query\":\"query userProfileCalendar($username: String!) { matchedUser(username: $username) { userCalendar { totalActiveDays submissionCalendar } } }\",\"variables\":{\"username\":\"") + LEETCODE_USERNAME + "\"}}";
 
   int code = http.POST(body);
   if (code != 200) {
@@ -296,6 +285,7 @@ void fetchStreak() {
     return;
   }
 
+  int totalActive = cal["totalActiveDays"] | 0;
   String calStr = cal["submissionCalendar"].as<String>();
 
   // Parse the encoded JSON-string of timestamps -> counts
@@ -329,40 +319,21 @@ void fetchStreak() {
   for (auto t : days) if (t == today) { state.solvedToday = true; break; }
 
   state.lastSolveTs = days.empty() ? 0 : days.back();
+  state.totalActiveDays = totalActive;
 
-  // Best streak: longest run of consecutive 86400-spaced days
-  int best = 0, run = 0;
-  time_t prev = 0;
-  for (auto t : days) {
-    if (run == 0 || t - prev == 86400) run++;
-    else run = 1;
-    if (run > best) best = run;
-    prev = t;
+  // Rolling last-7-days window: cell 6 = today, cell 0 = 6 days ago.
+  for (int i = 0; i < 7; i++) {
+    time_t dayKey = today - (time_t)(6 - i) * 86400;
+    state.weekSolved[i] = std::binary_search(days.begin(), days.end(), dayKey);
+    struct tm* g = gmtime(&dayKey);
+    state.weekLetters[i] = "SMTWTFS"[g->tm_wday]; // tm_wday: 0=Sun..6=Sat
   }
-  state.bestStreak = best;
 
-  // Current streak: walk back from latest day if it's today or yesterday
-  int cur = 0;
-  if (!days.empty()) {
-    time_t yesterday = today - 86400;
-    time_t last = days.back();
-    if (last == today || last == yesterday) {
-      cur = 1;
-      time_t expected = last - 86400;
-      for (int i = (int)days.size() - 2; i >= 0; i--) {
-        if (days[i] == expected) {
-          cur++;
-          expected -= 86400;
-        } else if (days[i] < expected) {
-          break;
-        }
-      }
-    }
-  }
-  state.currentStreak = cur;
   state.hasData = true;
   state.errorMsg = "";
-  Serial.printf("[streak] current=%d best=%d solvedToday=%d\n", cur, state.bestStreak, state.solvedToday);
+  Serial.printf("[streak] totalActiveDays=%d solvedToday=%d week=", state.totalActiveDays, state.solvedToday);
+  for (int i = 0; i < 7; i++) Serial.printf("%c%d ", state.weekLetters[i], state.weekSolved[i] ? 1 : 0);
+  Serial.println();
 }
 
 // ===== Urgency =====
@@ -420,8 +391,6 @@ void drawBoot(const char* msg) {
 
 void renderAll() {
   tft.fillScreen(COL_BG);
-  cdLastBuf = "";       // invalidate countdown cache so it redraws
-  cdLastColor = 0;
   drawScreen();
 }
 
@@ -447,13 +416,43 @@ void drawScreen() {
   }
 
   drawBorder(borderColor, useGlow);
-  drawBigNumber(String(state.currentStreak), numColor);
+  drawBigNumber(String(state.totalActiveDays), numColor);
+
+  drawWeekRow(SCREEN_HEIGHT * 70 / 100);
 
   if (state.solvedToday) {
-    drawGiantTick(SCREEN_WIDTH / 2, SCREEN_HEIGHT * 80 / 100, 55, COL_OK);
-  } else {
-    drawCountdown(numColor);
+    drawGiantTick(SCREEN_WIDTH / 2, SCREEN_HEIGHT * 85 / 100, 50, COL_OK);
   }
+}
+
+// Rolling 7-day row: weekday letters only, today rightmost.
+// Color is the whole signal: green = solved that day, yellow = not.
+void drawWeekRow(int yCenter) {
+  // Keep the row inside the rounded border (border spans x=8..SCREEN_WIDTH-8).
+  int inset = 18;
+  int usable = SCREEN_WIDTH - 2 * inset;
+  tft.setTextFont(2);   // small built-in 16px font
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  for (int i = 0; i < 7; i++) {
+    char letter[2] = { state.weekLetters[i], 0 };
+    int x = inset + usable * (2 * i + 1) / 14; // evenly spaced cell centers
+    if (state.weekSolved[i]) {
+      // Solved: green, faux-bold + slightly larger via multi-direction overprint.
+      tft.setTextColor(COL_OK, COL_BG);
+      tft.drawString(letter, x, yCenter);          // base (clears its box)
+      tft.setTextColor(COL_OK);                     // transparent overprints
+      tft.drawString(letter, x + 1, yCenter);
+      tft.drawString(letter, x,     yCenter + 1);
+      tft.drawString(letter, x + 1, yCenter + 1);
+    } else {
+      // Not solved: gray, plain/thin.
+      tft.setTextColor(COL_TEXT_DIM, COL_BG);
+      tft.drawString(letter, x, yCenter);
+    }
+  }
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
 }
 
 void drawBorder(uint16_t color, bool useGlow) {
@@ -489,32 +488,6 @@ void drawBigNumber(const String& n, uint16_t color) {
 
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
-  tft.setTextFont(1);
-}
-
-void drawCountdown(uint16_t color) {
-  int cy = SCREEN_HEIGHT * 80 / 100;
-
-  long secs = secondsToMidnight();
-  int hh = secs / 3600;
-  int mm = (secs % 3600) / 60;
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%02dh %02dm", hh, mm); // fixed-width
-
-  // Skip redraw if nothing changed (eliminates flicker between minute boundaries)
-  String cur = String(buf);
-  if (cur == cdLastBuf && color == cdLastColor) return;
-  cdLastBuf = cur;
-  cdLastColor = color;
-
-  tft.setFreeFont(&FreeSansBold18pt7b);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(color, COL_BG);
-  tft.setTextPadding(SCREEN_WIDTH - 60); // atomic clear+draw, no flicker
-  tft.drawString(buf, SCREEN_WIDTH / 2, cy);
-  tft.setTextPadding(0);
-
-  tft.setTextDatum(TL_DATUM);
   tft.setTextFont(1);
 }
 
